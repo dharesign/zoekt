@@ -35,6 +35,7 @@ import (
 	"go.uber.org/automaxprocs/maxprocs"
 	"golang.org/x/net/trace"
 
+	sglog "github.com/sourcegraph/log"
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/build"
 	"github.com/sourcegraph/zoekt/debugserver"
@@ -183,6 +184,8 @@ type Server struct {
 	// repositoriesSkipSymbolsCalculationAllowList is an allowlist for repositories that
 	// we skip calculating symbols metadata for during builds
 	repositoriesSkipSymbolsCalculationAllowList map[string]struct{}
+
+	Logger sglog.Logger
 }
 
 var debug = log.New(io.Discard, "", log.LstdFlags)
@@ -421,7 +424,17 @@ func (s *Server) processQueue() {
 
 			switch state {
 			case indexStateSuccess:
-				log.Printf("updated index %s in %v", args.String(), elapsed)
+				var branches []string
+				for _, b := range args.Branches {
+					branches = append(branches, fmt.Sprintf("%s=%s", b.Name, b.Version))
+				}
+
+				logger.Info("updated index",
+					sglog.String("repo", args.Name),
+					sglog.Uint32("id", args.RepoID),
+					sglog.Strings("branches", branches),
+					sglog.Duration("duration", elapsed),
+				)
 			case indexStateSuccessMeta:
 				log.Printf("updated meta %s in %v", args.String(), elapsed)
 			}
@@ -890,7 +903,7 @@ func printShardStats(fn string) error {
 }
 
 func srcLogLevelIsDebug() bool {
-	lvl := os.Getenv("SRC_LOG_LEVEL")
+	lvl := os.Getenv(sglog.EnvLogLevel)
 	return strings.EqualFold(lvl, "dbug") || strings.EqualFold(lvl, "debug")
 }
 
@@ -1095,7 +1108,7 @@ func newServer(conf rootConfig) (*Server, error) {
 		return nil, fmt.Errorf("failed to setup TMPDIR under %s: %v", conf.index, err)
 	}
 
-	if conf.dbg {
+	if srcLogLevelIsDebug() {
 		debug = log.New(os.Stderr, "", log.LstdFlags)
 	}
 
@@ -1148,6 +1161,8 @@ func newServer(conf rootConfig) (*Server, error) {
 		cpuCount = 1
 	}
 
+	logger := sglog.Scoped("server", "periodically reindexes enabled repositories on sourcegraph")
+
 	return &Server{
 		Sourcegraph:                       sg,
 		IndexDir:                          conf.index,
@@ -1162,11 +1177,41 @@ func newServer(conf rootConfig) (*Server, error) {
 		deltaBuildRepositoriesAllowList:   deltaBuildRepositoriesAllowList,
 		deltaShardNumberFallbackThreshold: deltaShardNumberFallbackThreshold,
 		repositoriesSkipSymbolsCalculationAllowList: reposShouldSkipSymbolsCalculation,
+		Logger: logger,
 	}, err
 }
 
 func main() {
-	if err := rootCmd().ParseAndRun(context.Background(), os.Args[1:]); err != nil {
+	cmd := rootCmd()
+	if err := cmd.Parse(os.Args[1:]); err != nil {
+		log.Fatal(err)
+	}
+
+	debugFlagOverride := false
+
+	flag := cmd.FlagSet.Lookup("debug")
+	if debugFlag, err := strconv.ParseBool(flag.Value.String()); err == nil {
+		// Debug flag overrides a non-debug logging level
+		debugFlagOverride = debugFlag && !srcLogLevelIsDebug()
+	}
+
+	name := "zoekt-sourcegraph-indexserver"
+
+	// if debug flag overrides the logging level set by environment var EnvLogLevel
+	// then update it before we call logger's Init()
+	if debugFlagOverride {
+		os.Setenv(sglog.EnvLogLevel, "debug")
+	}
+
+	syncLogs := sglog.Init(sglog.Resource{
+		Name:       name,
+		Version:    zoekt.Version,
+		InstanceID: hostnameBestEffort(),
+	})
+
+	defer syncLogs.Sync()
+
+	if err := cmd.Run(context.Background()); err != nil {
 		log.Fatal(err)
 	}
 }
