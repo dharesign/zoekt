@@ -599,7 +599,7 @@ func (d *indexData) readBloom(sec simpleSection) (bloom, error) {
 // results coming from this searcher are valid only for the lifetime
 // of the Searcher itself, ie. []byte members should be copied into
 // fresh buffers if the result is to survive closing the shard.
-func NewSearcher(r IndexFile) (Searcher, error) {
+func NewSearcher(r IndexFile) (Streamer, error) {
 	rd := &reader{r: r}
 
 	var toc indexTOC

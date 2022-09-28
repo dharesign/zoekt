@@ -34,15 +34,6 @@ type Client struct {
 	httpClient *http.Client
 }
 
-// SenderFunc is an adapter to allow the use of ordinary functions as Sender.
-// If f is a function with the appropriate signature, SenderFunc(f) is a Sender
-// that calls f.
-type SenderFunc func(result *zoekt.SearchResult)
-
-func (f SenderFunc) Send(result *zoekt.SearchResult) {
-	f(result)
-}
-
 // StreamSearch returns search results as stream by calling streamer.Send(event)
 // for each event returned by the server.
 //

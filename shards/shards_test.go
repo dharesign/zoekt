@@ -34,15 +34,19 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/grafana/regexp"
+
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
-	"github.com/sourcegraph/zoekt/stream"
 )
 
 type crashSearcher struct{}
 
 func (s *crashSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.SearchOptions) (*zoekt.SearchResult, error) {
 	panic("search")
+}
+
+func (s *crashSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zoekt.SearchOptions, sender zoekt.Sender) error {
+	panic("stream")
 }
 
 func (s *crashSearcher) List(ctx context.Context, q query.Q, opts *zoekt.ListOptions) (*zoekt.RepoList, error) {
@@ -62,7 +66,7 @@ func TestCrashResilience(t *testing.T) {
 	log.SetOutput(out)
 	defer log.SetOutput(os.Stderr)
 	ss := newShardedSearcher(2)
-	ss.ranked.Store([]*rankedShard{{Searcher: &crashSearcher{}}})
+	ss.ranked.Store([]*rankedShard{{Streamer: &crashSearcher{}}})
 
 	q := &query.Substring{Pattern: "hoi"}
 	opts := &zoekt.SearchOptions{}
@@ -114,6 +118,15 @@ func (s *rankSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.Search
 	}, nil
 }
 
+func (s *rankSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zoekt.SearchOptions, sender zoekt.Sender) error {
+	sr, err := s.Search(ctx, q, opts)
+	if err != nil {
+		return err
+	}
+	sender.Send(sr)
+	return nil
+}
+
 func (s *rankSearcher) List(ctx context.Context, q query.Q, opts *zoekt.ListOptions) (*zoekt.RepoList, error) {
 	r := zoekt.Repository{}
 	if s.repo != nil {
@@ -134,7 +147,7 @@ func TestOrderByShard(t *testing.T) {
 
 	n := 10 * runtime.GOMAXPROCS(0)
 	for i := 0; i < n; i++ {
-		ss.replace(map[string]zoekt.Searcher{
+		ss.replace(map[string]zoekt.Streamer{
 			fmt.Sprintf("shard%d", i): &rankSearcher{rank: uint16(i)},
 		})
 	}
@@ -182,7 +195,7 @@ func TestShardedSearcher_Ranking(t *testing.T) {
 		}
 		b := testIndexBuilder(t, r, docs...)
 		shard := searcherForTest(t, b)
-		ss.replace(map[string]zoekt.Searcher{
+		ss.replace(map[string]zoekt.Streamer{
 			fmt.Sprintf("key-%d", nextShardNum): shard,
 		})
 		nextShardNum++
@@ -225,7 +238,7 @@ func TestFilteringShardsByRepoSet(t *testing.T) {
 			repoSetNames = append(repoSetNames, repoName)
 		}
 
-		ss.replace(map[string]zoekt.Searcher{
+		ss.replace(map[string]zoekt.Streamer{
 			shardName: &rankSearcher{
 				repo: &zoekt.Repository{ID: hash(repoName), Name: repoName},
 				rank: uint16(n - i),
@@ -316,7 +329,7 @@ func TestUnloadIndex(t *testing.T) {
 	}
 
 	ss := newShardedSearcher(2)
-	ss.replace(map[string]zoekt.Searcher{"key": searcher})
+	ss.replace(map[string]zoekt.Streamer{"key": searcher})
 
 	var opts zoekt.SearchOptions
 	q := &query.Substring{Pattern: "needle"}
@@ -369,7 +382,7 @@ func TestShardedSearcher_List(t *testing.T) {
 
 	// Test duplicate removal when ListOptions.Minimal is true and false
 	ss := newShardedSearcher(4)
-	ss.replace(map[string]zoekt.Searcher{
+	ss.replace(map[string]zoekt.Streamer{
 		"1": searcherForTest(t, testIndexBuilder(t, repos[0], doc)),
 		"2": searcherForTest(t, testIndexBuilder(t, repos[0])),
 		"3": searcherForTest(t, testIndexBuilder(t, repos[1], doc)),
@@ -492,7 +505,7 @@ func testIndexBuilder(t testing.TB, repo *zoekt.Repository, docs ...zoekt.Docume
 	return b
 }
 
-func searcherForTest(t testing.TB, b *zoekt.IndexBuilder) zoekt.Searcher {
+func searcherForTest(t testing.TB, b *zoekt.IndexBuilder) zoekt.Streamer {
 	var buf bytes.Buffer
 	if err := b.Write(&buf); err != nil {
 		t.Fatal(err)
@@ -517,7 +530,7 @@ func reposForTest(n int) (result []*zoekt.Repository) {
 	return result
 }
 
-func testSearcherForRepo(b testing.TB, r *zoekt.Repository, numFiles int) zoekt.Searcher {
+func testSearcherForRepo(b testing.TB, r *zoekt.Repository, numFiles int) zoekt.Streamer {
 	builder := testIndexBuilder(b, r)
 
 	if err := builder.Add(zoekt.Document{
@@ -546,7 +559,7 @@ func BenchmarkShardedSearch(b *testing.B) {
 	repos := reposForTest(3000)
 	var repoSetIDs []uint32
 
-	shards := make(map[string]zoekt.Searcher, len(repos))
+	shards := make(map[string]zoekt.Streamer, len(repos))
 	for i, r := range repos {
 		shards[r.Name] = testSearcherForRepo(b, r, filesPerRepo)
 		if i%2 == 0 {
@@ -629,7 +642,7 @@ func TestRawQuerySearch(t *testing.T) {
 		r.RawConfig = rawConfig
 		b := testIndexBuilder(t, r, docs...)
 		shard := searcherForTest(t, b)
-		ss.replace(map[string]zoekt.Searcher{fmt.Sprintf("key-%d", nextShardNum): shard})
+		ss.replace(map[string]zoekt.Streamer{fmt.Sprintf("key-%d", nextShardNum): shard})
 		nextShardNum++
 	}
 	addShard("public", map[string]string{"public": "1"}, zoekt.Document{Name: "f1", Content: []byte("foo bar bas")})
@@ -966,10 +979,10 @@ func TestAtomCountScore(t *testing.T) {
 func testShardedStreamSearch(t *testing.T, q query.Q, ib *zoekt.IndexBuilder) []zoekt.FileMatch {
 	ss := newShardedSearcher(1)
 	searcher := searcherForTest(t, ib)
-	ss.replace(map[string]zoekt.Searcher{"r1": searcher})
+	ss.replace(map[string]zoekt.Streamer{"r1": searcher})
 
 	var files []zoekt.FileMatch
-	sender := stream.SenderFunc(func(result *zoekt.SearchResult) {
+	sender := zoekt.SenderFunc(func(result *zoekt.SearchResult) {
 		files = append(files, result.Files...)
 	})
 
@@ -982,7 +995,7 @@ func testShardedStreamSearch(t *testing.T, q query.Q, ib *zoekt.IndexBuilder) []
 func testShardedSearch(t *testing.T, q query.Q, ib *zoekt.IndexBuilder) []zoekt.FileMatch {
 	ss := newShardedSearcher(1)
 	searcher := searcherForTest(t, ib)
-	ss.replace(map[string]zoekt.Searcher{"r1": searcher})
+	ss.replace(map[string]zoekt.Streamer{"r1": searcher})
 
 	sres, _ := ss.Search(context.Background(), q, &zoekt.SearchOptions{})
 	return sres.Files

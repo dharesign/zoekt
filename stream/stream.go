@@ -84,7 +84,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	err = h.Searcher.StreamSearch(ctx, args.Q, args.Opts, SenderFunc(func(event *zoekt.SearchResult) {
+	err = h.Searcher.StreamSearch(ctx, args.Q, args.Opts, zoekt.SenderFunc(func(event *zoekt.SearchResult) {
 		// We don't want to send events over the wire if they just contain stats and no
 		// file matches. Hence, in case we didn't find any results, we will just
 		// aggregate the stats.

@@ -32,9 +32,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+
 	"github.com/sourcegraph/zoekt"
 	"github.com/sourcegraph/zoekt/query"
-	"github.com/sourcegraph/zoekt/stream"
 	"github.com/sourcegraph/zoekt/trace"
 )
 
@@ -164,7 +164,7 @@ var (
 )
 
 type rankedShard struct {
-	zoekt.Searcher
+	zoekt.Streamer
 
 	priority float64 // maximum priority across all repos in the shard
 
@@ -257,13 +257,13 @@ func (tl *loader) load(keys ...string) {
 		mu           sync.Mutex     // synchronizes writes to the shards map
 		wg           sync.WaitGroup // used to wait for all shards to load
 		sem          = semaphore.NewWeighted(int64(runtime.GOMAXPROCS(0)))
-		loadedShards = make(map[string]zoekt.Searcher)
+		loadedShards = make(map[string]zoekt.Streamer)
 	)
 
 	publishLoaded := func() {
 		mu.Lock()
 		chunk := loadedShards
-		loadedShards = make(map[string]zoekt.Searcher)
+		loadedShards = make(map[string]zoekt.Streamer)
 		mu.Unlock()
 		tl.ss.replace(chunk)
 	}
@@ -307,7 +307,7 @@ func (tl *loader) load(keys ...string) {
 }
 
 func (tl *loader) drop(keys ...string) {
-	shards := make(map[string]zoekt.Searcher, len(keys))
+	shards := make(map[string]zoekt.Streamer, len(keys))
 	for _, key := range keys {
 		shards[key] = nil
 	}
@@ -321,7 +321,7 @@ func (ss *shardedSearcher) String() string {
 // Close closes references to open files. It may be called only once.
 func (ss *shardedSearcher) Close() {
 	ss.mu.Lock()
-	shards := make(map[string]zoekt.Searcher, len(ss.shards))
+	shards := make(map[string]zoekt.Streamer, len(ss.shards))
 	for k := range ss.shards {
 		shards[k] = nil
 	}
@@ -471,7 +471,7 @@ func (ss *shardedSearcher) Search(ctx context.Context, q query.Q, opts *zoekt.Se
 	aggregate.Wait = time.Since(start)
 	start = time.Now()
 
-	done, err := ss.streamSearch(ctx, proc, q, opts, stream.SenderFunc(func(r *zoekt.SearchResult) {
+	done, err := ss.streamSearch(ctx, proc, q, opts, zoekt.SenderFunc(func(r *zoekt.SearchResult) {
 		aggregate.Stats.Add(r.Stats)
 
 		if len(r.Files) > 0 {
@@ -528,7 +528,7 @@ func (ss *shardedSearcher) StreamSearch(ctx context.Context, q query.Q, opts *zo
 		},
 	})
 
-	done, err := ss.streamSearch(ctx, proc, q, opts, stream.SenderFunc(func(event *zoekt.SearchResult) {
+	done, err := ss.streamSearch(ctx, proc, q, opts, zoekt.SenderFunc(func(event *zoekt.SearchResult) {
 		copyFiles(event)
 		sender.Send(event)
 	}))
@@ -606,9 +606,12 @@ func (ss *shardedSearcher) streamSearch(ctx context.Context, proc *process, q qu
 		go func() {
 			defer wg.Done()
 			for s := range search {
-				sr, err := searchOneShard(ctx, s, q, opts)
-				r := &result{priority: s.priority, SearchResult: sr, err: err}
-				results <- r
+				if err := searchOneShard(ctx, s, q, opts, zoekt.SenderFunc(func(sr *zoekt.SearchResult) {
+					r := &result{priority: s.priority, SearchResult: sr, err: err}
+					results <- r
+				})); err != nil {
+					results <- &result{priority: s.priority, SearchResult: nil, err: err}
+				}
 			}
 		}()
 	}
@@ -770,21 +773,13 @@ func copyFiles(sr *zoekt.SearchResult) {
 	}
 }
 
-func searchOneShard(ctx context.Context, s zoekt.Searcher, q query.Q, opts *zoekt.SearchOptions) (sr *zoekt.SearchResult, err error) {
+func searchOneShard(ctx context.Context, s zoekt.Streamer, q query.Q, opts *zoekt.SearchOptions, sender zoekt.Sender) (err error) {
 	metricSearchShardRunning.Inc()
 	defer func() {
 		metricSearchShardRunning.Dec()
-		if e := recover(); e != nil {
-			log.Printf("crashed shard: %s: %#v, %s", s, e, debug.Stack())
-
-			if sr == nil {
-				sr = &zoekt.SearchResult{}
-			}
-			sr.Stats.Crashes = 1
-		}
 	}()
 
-	return s.Search(ctx, q, opts)
+	return s.StreamSearch(ctx, q, opts, sender)
 }
 
 type shardListResult struct {
@@ -928,14 +923,14 @@ func (s *shardedSearcher) getShards() []*rankedShard {
 	return ranked
 }
 
-func mkRankedShard(s zoekt.Searcher) *rankedShard {
+func mkRankedShard(s zoekt.Streamer) *rankedShard {
 	q := query.Const{Value: true}
 	result, err := s.List(context.Background(), &q, nil)
 	if err != nil {
-		return &rankedShard{Searcher: s}
+		return &rankedShard{Streamer: s}
 	}
 	if len(result.Repos) == 0 {
-		return &rankedShard{Searcher: s}
+		return &rankedShard{Streamer: s}
 	}
 
 	var (
@@ -954,13 +949,13 @@ func mkRankedShard(s zoekt.Searcher) *rankedShard {
 	}
 
 	return &rankedShard{
-		Searcher: s,
+		Streamer: s,
 		repos:    repos,
 		priority: maxPriority,
 	}
 }
 
-func (s *shardedSearcher) replace(shards map[string]zoekt.Searcher) {
+func (s *shardedSearcher) replace(shards map[string]zoekt.Streamer) {
 	if len(shards) == 0 {
 		return
 	}
@@ -985,7 +980,7 @@ func (s *shardedSearcher) replace(shards map[string]zoekt.Searcher) {
 			s.shards[key] = r
 		}
 
-		if old != nil && old.Searcher != nil {
+		if old != nil && old.Streamer != nil {
 			//                 _ ___                /^^\ /^\  /^^\_
 			//     _          _@)@) \            ,,/ '` ~ `'~~ ', `\.
 			//   _/o\_ _ _ _/~`.`...'~\        ./~~..,'`','',.,' '  ~:
@@ -1036,7 +1031,7 @@ func (s *shardedSearcher) replace(shards map[string]zoekt.Searcher) {
 	metricShardsLoaded.Set(float64(len(ranked)))
 }
 
-func loadShard(fn string) (zoekt.Searcher, error) {
+func loadShard(fn string) (zoekt.Streamer, error) {
 	f, err := os.Open(fn)
 	if err != nil {
 		return nil, err

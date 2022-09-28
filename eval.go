@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log"
 	"regexp/syntax"
+	"runtime/debug"
 	"sort"
 	"strings"
 
@@ -142,6 +143,37 @@ func (o *SearchOptions) SetDefaults() {
 }
 
 func (d *indexData) Search(ctx context.Context, q query.Q, opts *SearchOptions) (sr *SearchResult, err error) {
+	aggregate := &SearchResult{
+		RepoURLs:      map[string]string{},
+		LineFragments: map[string]string{},
+	}
+	err = d.StreamSearch(ctx, q, opts, SenderFunc(func(sr *SearchResult) {
+		aggregate.Stats.Add(sr.Stats)
+
+		if len(sr.Files) > 0 {
+			aggregate.Files = append(aggregate.Files, sr.Files...)
+
+			for k, v := range sr.RepoURLs {
+				aggregate.RepoURLs[k] = v
+			}
+			for k, v := range sr.LineFragments {
+				aggregate.LineFragments[k] = v
+			}
+		}
+	}))
+	return aggregate, err
+}
+
+func (d *indexData) StreamSearch(ctx context.Context, q query.Q, opts *SearchOptions, sender Sender) (err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			log.Printf("crashed shard: %s: %#v, %s", d, e, debug.Stack())
+			sender.Send(&SearchResult{Stats: Stats{
+				Crashes: 1,
+			}})
+		}
+	}()
+
 	copyOpts := *opts
 	opts = &copyOpts
 	opts.SetDefaults()
@@ -149,40 +181,47 @@ func (d *indexData) Search(ctx context.Context, q query.Q, opts *SearchOptions) 
 
 	var res SearchResult
 	if len(d.fileNameIndex) == 0 {
-		return &res, nil
+		sender.Send(&res)
+		return
 	}
 
 	select {
 	case <-ctx.Done():
 		res.Stats.ShardsSkipped++
-		return &res, nil
+		sender.Send(&res)
+		return
 	default:
 	}
 
 	q = d.simplify(q)
 	if c, ok := q.(*query.Const); ok && !c.Value {
-		return &res, nil
+		sender.Send(&res)
+		return
 	}
 
 	if opts.EstimateDocCount {
 		res.Stats.ShardFilesConsidered = len(d.fileBranchMasks)
-		return &res, nil
+		sender.Send(&res)
+		return
 	}
 
 	q = query.Map(q, query.ExpandFileContent)
 
 	mt, err := d.newMatchTree(q)
 	if err != nil {
-		return nil, err
+		sender.Send(&res)
+		return
 	}
 
 	mt, err = pruneMatchTree(mt)
 	if err != nil {
-		return nil, err
+		sender.Send(&res)
+		return
 	}
 	if mt == nil {
 		res.Stats.ShardsSkippedFilter++
-		return &res, nil
+		sender.Send(&res)
+		return
 	}
 
 	totalAtomCount := 0
@@ -420,7 +459,8 @@ nextFileMatch:
 			atom.updateStats(&res.Stats)
 		}
 	})
-	return &res, nil
+	sender.Send(&res)
+	return nil
 }
 
 func addRepo(res *SearchResult, repo *Repository) {

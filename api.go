@@ -809,3 +809,12 @@ type Streamer interface {
 	Searcher
 	StreamSearch(ctx context.Context, q query.Q, opts *SearchOptions, sender Sender) (err error)
 }
+
+// SenderFunc is an adapter to allow the use of ordinary functions as Sender.
+// If f is a function with the appropriate signature, SenderFunc(f) is a Sender
+// that calls f.
+type SenderFunc func(result *SearchResult)
+
+func (f SenderFunc) Send(result *SearchResult) {
+	f(result)
+}
