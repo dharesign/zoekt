@@ -36,6 +36,13 @@ import (
 
 const day = time.Hour * 24
 
+// PendingRepo carries a repository directory path along with the indexing
+// configuration from the mirror config entry that produced it.
+type PendingRepo struct {
+	dir         string
+	indexConfig IndexConfigEntry
+}
+
 func loggedRun(cmd *exec.Cmd) (out, err []byte) {
 	outBuf := &bytes.Buffer{}
 	errBuf := &bytes.Buffer{}
@@ -89,7 +96,7 @@ func (o *Options) defineFlags() {
 
 // periodicFetch runs git-fetch every once in a while. Results are
 // posted on pendingRepos.
-func periodicFetch(repoDir, indexDir string, opts *Options, pendingRepos chan<- string) {
+func periodicFetch(repoDir, indexDir string, opts *Options, pendingRepos chan<- PendingRepo) {
 	t := time.NewTicker(opts.fetchInterval)
 	for {
 		repos, err := gitindex.FindGitRepos(repoDir)
@@ -108,12 +115,12 @@ func periodicFetch(repoDir, indexDir string, opts *Options, pendingRepos chan<- 
 			if ok := fetchGitRepo(dir); !ok {
 				later[dir] = struct{}{}
 			} else {
-				pendingRepos <- dir
+				pendingRepos <- PendingRepo{dir: dir}
 			}
 		}
 
 		for r := range later {
-			pendingRepos <- r
+			pendingRepos <- PendingRepo{dir: r}
 		}
 
 		<-t.C
@@ -137,9 +144,9 @@ func fetchGitRepo(dir string) bool {
 
 // indexPendingRepos consumes the directories on the repos channel and
 // indexes them, sequentially.
-func indexPendingRepos(indexDir, repoDir string, opts *Options, repos <-chan string) {
-	for dir := range repos {
-		indexPendingRepo(dir, indexDir, repoDir, opts)
+func indexPendingRepos(indexDir, repoDir string, opts *Options, repos <-chan PendingRepo) {
+	for repo := range repos {
+		indexPendingRepo(repo, indexDir, repoDir, opts)
 
 		// Failures (eg. timeout) will leave temp files
 		// around. We have to clean them, or they will fill up the indexing volume.
@@ -153,7 +160,7 @@ func indexPendingRepos(indexDir, repoDir string, opts *Options, repos <-chan str
 	}
 }
 
-func indexPendingRepo(dir, indexDir, repoDir string, opts *Options) {
+func indexPendingRepo(repo PendingRepo, indexDir, repoDir string, opts *Options) {
 	ctx, cancel := context.WithTimeout(context.Background(), opts.indexTimeout)
 	defer cancel()
 	args := []string{
@@ -163,8 +170,16 @@ func indexPendingRepo(dir, indexDir, repoDir string, opts *Options) {
 		"-index", indexDir,
 		"-incremental",
 	}
+
+	if repo.indexConfig.Branches != "" {
+		args = append(args, "-branches", repo.indexConfig.Branches, "-allow_missing_branches")
+	}
+	if repo.indexConfig.BranchPrefix != "" {
+		args = append(args, "-prefix", repo.indexConfig.BranchPrefix)
+	}
+
 	args = append(args, opts.indexFlags...)
-	args = append(args, dir)
+	args = append(args, repo.dir)
 	cmd := exec.CommandContext(ctx, "zoekt-git-index", args...)
 	loggedRun(cmd)
 }
@@ -284,7 +299,7 @@ func main() {
 		log.Fatalf("readConfigURL(%s): %v", opts.mirrorConfigFile, err)
 	}
 
-	pendingRepos := make(chan string, 10)
+	pendingRepos := make(chan PendingRepo, 10)
 	go periodicMirrorFile(repoDir, &opts, pendingRepos)
 	go deleteLogsLoop(logDir, opts.maxLogAge)
 	go deleteOrphanIndexes(*indexDir, repoDir, opts.fetchInterval)

@@ -30,6 +30,15 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// IndexConfigEntry contains per-repo indexing configuration that is passed
+// through to zoekt-git-index at index time.
+type IndexConfigEntry struct {
+	// Branches is a comma-separated list of branches to index, with support
+	// for wildcards (e.g. "main,release-*"). Defaults to HEAD if unset.
+	Branches     string
+	BranchPrefix string
+}
+
 type ConfigEntry struct {
 	GithubUser             string
 	GithubOrg              string
@@ -59,6 +68,8 @@ type ConfigEntry struct {
 	ExcludeUserRepos       bool
 	Forks                  bool
 	Visibility             []string
+
+	IndexConfig IndexConfigEntry
 }
 
 func randomize(entries []ConfigEntry) []ConfigEntry {
@@ -135,7 +146,7 @@ func watchFile(path string) (<-chan struct{}, error) {
 	return out, nil
 }
 
-func periodicMirrorFile(repoDir string, opts *Options, pendingRepos chan<- string) {
+func periodicMirrorFile(repoDir string, opts *Options, pendingRepos chan<- PendingRepo) {
 	ticker := time.NewTicker(opts.mirrorInterval)
 
 	var watcher <-chan struct{}
@@ -166,7 +177,7 @@ func periodicMirrorFile(repoDir string, opts *Options, pendingRepos chan<- strin
 	}
 }
 
-func executeMirror(cfg []ConfigEntry, repoDir string, pendingRepos chan<- string) {
+func executeMirror(cfg []ConfigEntry, repoDir string, pendingRepos chan<- PendingRepo) {
 	// Randomize the ordering in which we query
 	// things. This is to ensure that quota limits don't
 	// always hit the last one in the list.
@@ -345,7 +356,10 @@ func executeMirror(cfg []ConfigEntry, repoDir string, pendingRepos chan<- string
 				continue
 			}
 
-			pendingRepos <- string(fn)
+			pendingRepos <- PendingRepo{
+				dir:         string(fn),
+				indexConfig: c.IndexConfig,
+			}
 		}
 
 	}
